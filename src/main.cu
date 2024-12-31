@@ -8,13 +8,14 @@
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--debug] [--save-seams]\n", argv[0]);
+        printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--debug] [--save-seams] [--horizontal]\n", argv[0]);
         return 1;
     }
 
     // Default values for options
     int num_seams = 1; 
     int save_seam_path = 0; 
+    int direction = 0; // 0 for vertical, 1 for horizontal
     char *input_image_path = NULL;
     char *output_image_path = NULL;
 
@@ -28,9 +29,11 @@ int main(int argc, char *argv[]) {
             num_seams = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--save-seams") == 0) {
             save_seam_path = 1;
+        } else if (strcmp(argv[i], "--horizontal") == 0) {
+            direction = 1; // Set direction to horizontal
         } else {
             printf("Unknown option: %s\n", argv[i]);
-            printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--save-seams]\n", argv[0]);
+            printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--debug] [--save-seams] [--horizontal]\n", argv[0]);
             return 1;
         }
     }
@@ -55,9 +58,9 @@ int main(int argc, char *argv[]) {
         compute_energy(&img, device_energy);
         printf("Energy map computed on GPU for seam %d.\n", i + 1);
 
-        // Identify and remove one vertical seam
-        int *seam = remove_seam_with_path(&img, device_energy);
-        printf("Vertical seam %d removed.\n", i + 1);
+        // Identify and remove one seam based on direction
+        int *seam = remove_seam_with_path(&img, device_energy, direction);
+        printf("%s seam %d removed.\n", direction == 0 ? "Vertical" : "Horizontal", i + 1);
 
         // Save the seam path overlay if enabled
         if (save_seam_path) {

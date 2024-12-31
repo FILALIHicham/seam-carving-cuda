@@ -11,24 +11,41 @@ __global__ void compute_row_cumulative_energy(
     int *backtrack,
     int width,
     int height,
-    int current_row
+    int current_row,
+    int direction
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     if (x >= width) return;
 
-    int idx = current_row * width + x;
-    
+    int idx, energy_idx;
+    if (direction == 0) {  // Vertical seam
+        idx = current_row * width + x;
+        energy_idx = idx;
+    } else {  // Horizontal seam
+        idx = current_row + x * height;  // Transposed layout
+        energy_idx = current_row * width + x;  // Original layout for energy
+    }
+
     if (current_row == 0) {
         // First row just copies the energy values
-        cumulative_energy[idx] = energy[idx];
+        cumulative_energy[idx] = energy[energy_idx];
         backtrack[idx] = x;
         return;
     }
 
-    // For other rows, find minimum from above
-    float left = (x > 0) ? cumulative_energy[(current_row-1) * width + (x-1)] : INFINITY;
-    float middle = cumulative_energy[(current_row-1) * width + x];
-    float right = (x < width-1) ? cumulative_energy[(current_row-1) * width + (x+1)] : INFINITY;
+    // Neighbor calculations
+    float left, middle, right;
+    if (direction == 0) {  // Vertical seam
+        int prev_row = (current_row - 1) * width;
+        left = (x > 0) ? cumulative_energy[prev_row + (x - 1)] : INFINITY;
+        middle = cumulative_energy[prev_row + x];
+        right = (x < width - 1) ? cumulative_energy[prev_row + (x + 1)] : INFINITY;
+    } else {  // Horizontal seam
+        int prev_row = current_row - 1;
+        left = (x > 0) ? cumulative_energy[prev_row + (x - 1) * height] : INFINITY;
+        middle = cumulative_energy[prev_row + x * height];
+        right = (x < width - 1) ? cumulative_energy[prev_row + (x + 1) * height] : INFINITY;
+    }
 
     // Find minimum of the three possible paths
     float min_energy = middle;
@@ -44,13 +61,15 @@ __global__ void compute_row_cumulative_energy(
     }
 
     // Store cumulative energy and backtrack pointer
-    cumulative_energy[idx] = energy[idx] + min_energy;
+    cumulative_energy[idx] = energy[energy_idx] + min_energy;
     backtrack[idx] = min_x;
 }
 
-int* remove_seam_with_path(Image *img, float *device_energy) {
+int* remove_seam_with_path(Image *img, float *device_energy, int direction) {
     int width = img->width;
     int height = img->height;
+    int seam_length = direction == 0 ? height : width;
+    int search_width = direction == 0 ? width : height;
 
     size_t cumulative_size = width * height * sizeof(float);
     size_t backtrack_size = width * height * sizeof(int);
@@ -63,26 +82,25 @@ int* remove_seam_with_path(Image *img, float *device_energy) {
 
     // Compute cumulative energy row by row
     dim3 block_dim(256, 1);
-    dim3 grid_dim((width + block_dim.x - 1) / block_dim.x, 1);
+    dim3 grid_dim((search_width + block_dim.x - 1) / block_dim.x, 1);
 
-    for (int row = 0; row < height; row++) {
+    for (int row = 0; row < seam_length; row++) {
         compute_row_cumulative_energy<<<grid_dim, block_dim>>>(
             device_energy,
             cumulative_energy,
             backtrack,
-            width,
-            height,
-            row
+            search_width,
+            seam_length,
+            row,
+            direction
         );
         
-        // Check for kernel errors after each row
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "Kernel error at row %d: %s\n", row, cudaGetErrorString(err));
             exit(1);
         }
         
-        // Ensure row is complete before moving to next row
         cudaDeviceSynchronize();
     }
 
@@ -97,11 +115,16 @@ int* remove_seam_with_path(Image *img, float *device_energy) {
     copy_to_host(host_cumulative, cumulative_energy, cumulative_size);
     copy_to_host(host_backtrack, backtrack, backtrack_size);
 
-    // Find minimum energy in bottom row
-    float min_energy = host_cumulative[(height-1) * width];
+    // Find minimum energy in last row/column
+    float min_energy = INFINITY;
     int seam_end = 0;
-    for (int x = 1; x < width; x++) {
-        float current = host_cumulative[(height-1) * width + x];
+    int last_row_offset = (seam_length - 1) * (direction == 0 ? search_width : 1);
+
+    for (int x = 0; x < search_width; x++) {
+        float current = direction == 0 ?
+            host_cumulative[last_row_offset + x] :
+            host_cumulative[x * seam_length + (seam_length - 1)];
+        
         if (current < min_energy) {
             min_energy = current;
             seam_end = x;
@@ -109,42 +132,65 @@ int* remove_seam_with_path(Image *img, float *device_energy) {
     }
 
     // Backtrack to find seam path
-    int *seam = (int *)malloc(height * sizeof(int));
+    int *seam = (int *)malloc(seam_length * sizeof(int));
     if (!seam) {
         fprintf(stderr, "Failed to allocate seam path memory\n");
         exit(1);
     }
     
-    seam[height-1] = seam_end;
-    for (int y = height-2; y >= 0; y--) {
-        seam[y] = host_backtrack[(y+1) * width + seam[y+1]];
+    seam[seam_length-1] = seam_end;
+
+    for (int i = seam_length - 2; i >= 0; i--) {
+        int curr_x = seam[i + 1];
+        if (direction == 0) {
+            seam[i] = host_backtrack[i * search_width + curr_x];
+        } else {
+            seam[i] = host_backtrack[curr_x * seam_length + i];
+        }
     }
 
     // Remove seam from image
-    unsigned char *new_data = (unsigned char *)malloc((width-1) * height * 3);
-    if (!new_data) {
-        fprintf(stderr, "Failed to allocate new image memory\n");
-        exit(1);
+    unsigned char *new_data = NULL;
+
+    if (direction == 0) {  // Vertical seam -> new width = width - 1
+        new_data = (unsigned char *)malloc((width - 1) * height * 3);
+    } else {               // Horizontal seam -> new height = height - 1
+        new_data = (unsigned char *)malloc(width * (height - 1) * 3);
     }
 
-    for (int y = 0; y < height; y++) {
-        int offset = 0;
-        for (int x = 0; x < width; x++) {
-            if (x == seam[y]) {
-                offset = -1;
-                continue;
-            }
-            for (int c = 0; c < 3; c++) {
-                new_data[(y * (width-1) + (x + offset)) * 3 + c] = 
-                    img->data[(y * width + x) * 3 + c];
+    if (direction == 0) {  // Vertical seam
+        for (int y = 0; y < height; y++) {
+            int offset = 0;
+            for (int x = 0; x < width; x++) {
+                if (x == seam[y]) {
+                    offset = -1;
+                    continue;
+                }
+                for (int c = 0; c < 3; c++) {
+                    new_data[(y * (width - 1) + (x + offset)) * 3 + c] = 
+                        img->data[(y * width + x) * 3 + c];
+                }
             }
         }
+        img->width--;
+    } else {  // Horizontal seam
+        for (int y = 0; y < height; y++) {
+            if (y == seam[0]) continue;
+            
+            int new_y = y > seam[0] ? y - 1 : y;
+            for (int x = 0; x < width; x++) {
+                for (int c = 0; c < 3; c++) {
+                    new_data[(new_y * width + x) * 3 + c] = 
+                        img->data[(y * width + x) * 3 + c];
+                }
+            }
+        }
+        img->height--;
     }
 
     // Update image
     free(img->data);
     img->data = new_data;
-    img->width--;
 
     // Cleanup
     free(host_cumulative);
