@@ -24,7 +24,7 @@ __global__ void compute_row_cumulative_energy(
         energy_idx = idx;
     } else {  // Horizontal seam
         idx = current_row + x * height;  // Transposed layout
-        energy_idx = current_row * width + x;  // Original layout for energy
+        energy_idx = current_row * width + x;  
     }
 
     if (current_row == 0) {
@@ -275,71 +275,148 @@ int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *
     return seams;
 }
 
-// Function to insert a single pre-calculated seam
+__global__ void insert_seam_kernel(
+    const unsigned char *input,
+    unsigned char *output,
+    const int *seam,
+    int width,
+    int height,
+    int direction  // 0 for vertical, 1 for horizontal
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int max_idx = direction == 0 ? height : width;
+    if (idx >= max_idx) return;
+    
+    if (direction == 0) {  // Vertical seam
+        int y = idx;
+        int seam_x = seam[y];
+        
+        // Process each pixel in the row
+        for (int x = 0; x <= width; x++) {
+            if (x == seam_x) {
+                // Interpolate new pixel
+                int left_x = max(0, x - 1);
+                int right_x = min(width - 1, x);
+                
+                for (int c = 0; c < 3; c++) {
+                    int left_val = input[(y * width + left_x) * 3 + c];
+                    int right_val = input[(y * width + right_x) * 3 + c];
+                    output[(y * (width + 1) + x) * 3 + c] = (left_val + right_val) / 2;
+                }
+            } else if (x < seam_x) {
+                // Copy pixels before seam
+                for (int c = 0; c < 3; c++) {
+                    output[(y * (width + 1) + x) * 3 + c] = input[(y * width + x) * 3 + c];
+                }
+            } else { // x > seam_x
+                // Copy pixels after seam
+                for (int c = 0; c < 3; c++) {
+                    output[(y * (width + 1) + x) * 3 + c] = input[(y * width + (x - 1)) * 3 + c];
+                }
+            }
+        }
+    } else {  // Horizontal seam
+        int x = idx;
+        int seam_y = seam[x];
+        
+        // Process each pixel in the column
+        for (int y = 0; y <= height; y++) {
+            if (y == seam_y) {
+                // Interpolate new pixel
+                int above_y = max(0, y - 1);
+                int below_y = min(height - 1, y);
+                
+                for (int c = 0; c < 3; c++) {
+                    int above_val = input[(above_y * width + x) * 3 + c];
+                    int below_val = input[(below_y * width + x) * 3 + c];
+                    output[(y * width + x) * 3 + c] = (above_val + below_val) / 2;
+                }
+            } else if (y < seam_y) {
+                // Copy pixels above seam
+                for (int c = 0; c < 3; c++) {
+                    output[(y * width + x) * 3 + c] = input[(y * width + x) * 3 + c];
+                }
+            } else { // y > seam_y
+                // Copy pixels below seam
+                for (int c = 0; c < 3; c++) {
+                    output[(y * width + x) * 3 + c] = input[((y - 1) * width + x) * 3 + c];
+                }
+            }
+        }
+    }
+}
+
 void insert_seam(Image *img, int *seam, int direction) {
     int width = img->width;
     int height = img->height;
-    unsigned char *new_data = NULL;
     
-    if (direction == 0) {  // Vertical seam
-        new_data = (unsigned char *)malloc((width + 1) * height * 3);
-        for (int y = 0; y < height; y++) {
-            int offset = 0;
-            for (int x = 0; x < width + 1; x++) {
-                if (x == seam[y]) {
-                    // Average with neighbors
-                    int left_x = x - 1;
-                    int right_x = x;
-                    if (left_x < 0) left_x = 0;
-                    if (right_x >= width) right_x = width - 1;
-                    
-                    for (int c = 0; c < 3; c++) {
-                        int left_val = img->data[(y * width + left_x) * 3 + c];
-                        int right_val = img->data[(y * width + right_x) * 3 + c];
-                        new_data[(y * (width + 1) + x) * 3 + c] = (left_val + right_val) / 2;
-                    }
-                    offset = 1;
-                } else {
-                    for (int c = 0; c < 3; c++) {
-                        new_data[(y * (width + 1) + x) * 3 + c] = 
-                            img->data[(y * width + (x - offset)) * 3 + c];
-                    }
-                }
-            }
-        }
+    // Calculate sizes
+    size_t input_size = width * height * 3;
+    size_t output_size = direction == 0 ? 
+        (width + 1) * height * 3 : 
+        width * (height + 1) * 3;
+    size_t seam_size = direction == 0 ? height * sizeof(int) : width * sizeof(int);
+    
+    // Allocate device memory
+    unsigned char *d_input, *d_output;
+    int *d_seam;
+    
+    allocate_device_memory((void **)&d_input, input_size);
+    allocate_device_memory((void **)&d_output, output_size);
+    allocate_device_memory((void **)&d_seam, seam_size);
+    
+    // Copy data to device
+    copy_to_device(d_input, img->data, input_size);
+    copy_to_device(d_seam, seam, seam_size);
+    
+    // Launch kernel
+    int max_threads = 256;
+    int num_blocks = direction == 0 ? 
+        (height + max_threads - 1) / max_threads : 
+        (width + max_threads - 1) / max_threads;
+    
+    insert_seam_kernel<<<num_blocks, max_threads>>>(
+        d_input,
+        d_output,
+        d_seam,
+        width,
+        height,
+        direction
+    );
+    
+    // Check for kernel errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel error: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    
+    // Synchronize device
+    cudaDeviceSynchronize();
+    
+    // Allocate and copy back result
+    unsigned char *new_data = (unsigned char *)malloc(output_size);
+    if (!new_data) {
+        fprintf(stderr, "Failed to allocate host memory for output\n");
+        exit(1);
+    }
+    
+    copy_to_host(new_data, d_output, output_size);
+    
+    // Update image
+    free(img->data);
+    img->data = new_data;
+    
+    // Update dimensions
+    if (direction == 0) {
         img->width++;
-    } else {  // Horizontal seam
-        new_data = (unsigned char *)malloc(width * (height + 1) * 3);
-        for (int y = 0; y < height + 1; y++) {
-            if (y == seam[0]) {
-                // Average with neighbors
-                int above_y = y - 1;
-                int below_y = y;
-                if (above_y < 0) above_y = 0;
-                if (below_y >= height) below_y = height - 1;
-                
-                for (int x = 0; x < width; x++) {
-                    for (int c = 0; c < 3; c++) {
-                        int above_val = img->data[(above_y * width + x) * 3 + c];
-                        int below_val = img->data[(below_y * width + x) * 3 + c];
-                        new_data[(y * width + x) * 3 + c] = (above_val + below_val) / 2;
-                    }
-                }
-            } else {
-                int src_y = y > seam[0] ? y - 1 : y;
-                for (int x = 0; x < width; x++) {
-                    for (int c = 0; c < 3; c++) {
-                        new_data[(y * width + x) * 3 + c] = 
-                            img->data[(src_y * width + x) * 3 + c];
-                    }
-                }
-            }
-        }
+    } else {
         img->height++;
     }
     
-    // Update image data
-    free(img->data);
-    img->data = new_data;
+    // Cleanup device memory
+    free_device_memory(d_input);
+    free_device_memory(d_output);
+    free_device_memory(d_seam);
 }
-
