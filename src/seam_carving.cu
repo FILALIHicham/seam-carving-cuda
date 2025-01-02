@@ -1,5 +1,6 @@
 #include "seam_carving.h"
 #include "gpu_memory.h"
+#include "energy.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -200,3 +201,145 @@ int* remove_seam_with_path(Image *img, float *device_energy, int direction) {
 
     return seam;
 }
+
+// Function to store k seams before insertion
+int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *seam_lengths) {
+    int width = img->width;
+    int height = img->height;
+    
+    // Allocate array to store k seams
+    int **seams = (int **)malloc(k * sizeof(int *));
+    if (!seams) {
+        fprintf(stderr, "Failed to allocate seams array\n");
+        exit(1);
+    }
+    
+    // Create a temporary image for seam calculation
+    Image temp_img = {width, height, NULL};
+    temp_img.data = (unsigned char *)malloc(width * height * 3);
+    if (!temp_img.data) {
+        fprintf(stderr, "Failed to allocate temporary image data\n");
+        exit(1);
+    }
+    memcpy(temp_img.data, img->data, width * height * 3);
+    
+    // Calculate initial energy size
+    size_t energy_size = width * height * sizeof(float);
+    
+    // Create temporary energy map
+    float *temp_energy;
+    allocate_device_memory((void **)&temp_energy, energy_size);
+    
+    // Copy initial energy map
+    copy_to_device(device_energy, temp_energy, energy_size);
+    
+    // Find k seams
+    for (int i = 0; i < k; i++) {
+        // Compute energy for current state
+        compute_energy(&temp_img, temp_energy);
+        
+        // Find seam
+        seam_lengths[i] = direction == 0 ? height : width;
+        seams[i] = remove_seam_with_path(&temp_img, temp_energy, direction);
+        
+        if (!seams[i]) {
+            fprintf(stderr, "Failed to find seam %d\n", i);
+            exit(1);
+        }
+        
+        // Update energy map size after removal
+        if (direction == 0) {
+            width--;
+            energy_size = width * height * sizeof(float);
+        } else {
+            height--;
+            energy_size = width * height * sizeof(float);
+        }
+        
+        // Reallocate temp_energy with new size
+        float *new_temp_energy;
+        allocate_device_memory((void **)&new_temp_energy, energy_size);
+        free_device_memory(temp_energy);
+        temp_energy = new_temp_energy;
+        
+        // Skip energy update for the last iteration
+        if (i < k - 1) {
+            compute_energy(&temp_img, temp_energy);
+        }
+    }
+    
+    // Cleanup temporary resources
+    free_image(temp_img);
+    free_device_memory(temp_energy);
+    
+    return seams;
+}
+
+// Function to insert a single pre-calculated seam
+void insert_seam(Image *img, int *seam, int direction) {
+    int width = img->width;
+    int height = img->height;
+    unsigned char *new_data = NULL;
+    
+    if (direction == 0) {  // Vertical seam
+        new_data = (unsigned char *)malloc((width + 1) * height * 3);
+        for (int y = 0; y < height; y++) {
+            int offset = 0;
+            for (int x = 0; x < width + 1; x++) {
+                if (x == seam[y]) {
+                    // Average with neighbors
+                    int left_x = x - 1;
+                    int right_x = x;
+                    if (left_x < 0) left_x = 0;
+                    if (right_x >= width) right_x = width - 1;
+                    
+                    for (int c = 0; c < 3; c++) {
+                        int left_val = img->data[(y * width + left_x) * 3 + c];
+                        int right_val = img->data[(y * width + right_x) * 3 + c];
+                        new_data[(y * (width + 1) + x) * 3 + c] = (left_val + right_val) / 2;
+                    }
+                    offset = 1;
+                } else {
+                    for (int c = 0; c < 3; c++) {
+                        new_data[(y * (width + 1) + x) * 3 + c] = 
+                            img->data[(y * width + (x - offset)) * 3 + c];
+                    }
+                }
+            }
+        }
+        img->width++;
+    } else {  // Horizontal seam
+        new_data = (unsigned char *)malloc(width * (height + 1) * 3);
+        for (int y = 0; y < height + 1; y++) {
+            if (y == seam[0]) {
+                // Average with neighbors
+                int above_y = y - 1;
+                int below_y = y;
+                if (above_y < 0) above_y = 0;
+                if (below_y >= height) below_y = height - 1;
+                
+                for (int x = 0; x < width; x++) {
+                    for (int c = 0; c < 3; c++) {
+                        int above_val = img->data[(above_y * width + x) * 3 + c];
+                        int below_val = img->data[(below_y * width + x) * 3 + c];
+                        new_data[(y * width + x) * 3 + c] = (above_val + below_val) / 2;
+                    }
+                }
+            } else {
+                int src_y = y > seam[0] ? y - 1 : y;
+                for (int x = 0; x < width; x++) {
+                    for (int c = 0; c < 3; c++) {
+                        new_data[(y * width + x) * 3 + c] = 
+                            img->data[(src_y * width + x) * 3 + c];
+                    }
+                }
+            }
+        }
+        img->height++;
+    }
+    
+    // Update image data
+    free(img->data);
+    img->data = new_data;
+}
+

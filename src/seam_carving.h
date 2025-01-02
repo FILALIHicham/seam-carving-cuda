@@ -3,7 +3,12 @@
 
 #include "utils.h" 
 
-// Removes one vertical seam from the image
+// Removes one seam from the image
 int* remove_seam_with_path(Image *img, float *device_energy, int direction);
+
+int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *seam_lengths);
+
+// Adds one seam to the image
+void insert_seam(Image *img, int *seam, int direction);
 
 #endif // SEAM_CARVING_H
