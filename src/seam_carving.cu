@@ -5,6 +5,70 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define BLOCK_SIZE_X 256
+
+__global__ void compute_row_cumulative_energy_optimized(
+    const float *energy,
+    float *cumulative_energy,
+    int *backtrack,
+    int width,
+    int height,
+    int current_row,
+    int direction
+) {
+    __shared__ float prev_cumulative[BLOCK_SIZE_X + 2];
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x >= width)
+        return;
+
+    int idx, energy_idx;
+    if (direction == 0) {  // Vertical seam
+        idx = current_row * width + x;
+        energy_idx = idx;
+    } else {  // Horizontal seam
+        idx = current_row + x * height;
+        energy_idx = current_row * width + x;
+    }
+
+    if (current_row == 0) {
+        cumulative_energy[idx] = energy[energy_idx];
+        backtrack[idx] = x;
+        return;
+    }
+
+    // Load previous row's data into shared memory
+    int prev_idx = ((current_row - 1) * width + x);
+    prev_cumulative[threadIdx.x + 1] = (x >= 0 && x < width) ? cumulative_energy[prev_idx] : INFINITY;
+
+    if (threadIdx.x == 0)
+        prev_cumulative[0] = (x > 0) ? cumulative_energy[prev_idx - 1] : INFINITY;
+    if (threadIdx.x == BLOCK_SIZE_X - 1)
+        prev_cumulative[BLOCK_SIZE_X + 1] = (x < width - 1) ? cumulative_energy[prev_idx + 1] : INFINITY;
+
+    __syncthreads();
+
+    float left = (x > 0) ? prev_cumulative[threadIdx.x] : INFINITY;
+    float middle = prev_cumulative[threadIdx.x + 1];
+    float right = (x < width - 1) ? prev_cumulative[threadIdx.x + 2] : INFINITY;
+
+    float min_energy = middle;
+    int min_x = x;
+
+    if (left < min_energy) {
+        min_energy = left;
+        min_x = x - 1;
+    }
+    if (right < min_energy) {
+        min_energy = right;
+        min_x = x + 1;
+    }
+
+    cumulative_energy[idx] = energy[energy_idx] + min_energy;
+    backtrack[idx] = min_x;
+}
+
 // Kernel to compute cumulative energy map
 __global__ void compute_row_cumulative_energy(
     const float *energy,
@@ -66,7 +130,7 @@ __global__ void compute_row_cumulative_energy(
     backtrack[idx] = min_x;
 }
 
-int* remove_seam_with_path(Image *img, float *device_energy, int direction) {
+int* remove_seam_with_path(Image *img, float *device_energy, int direction, bool optimized) {
     int width = img->width;
     int height = img->height;
     int seam_length = direction == 0 ? height : width;
@@ -85,24 +149,47 @@ int* remove_seam_with_path(Image *img, float *device_energy, int direction) {
     dim3 block_dim(256, 1);
     dim3 grid_dim((search_width + block_dim.x - 1) / block_dim.x, 1);
 
-    for (int row = 0; row < seam_length; row++) {
-        compute_row_cumulative_energy<<<grid_dim, block_dim>>>(
-            device_energy,
-            cumulative_energy,
-            backtrack,
-            search_width,
-            seam_length,
-            row,
-            direction
-        );
-        
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Kernel error at row %d: %s\n", row, cudaGetErrorString(err));
-            exit(1);
+    if (optimized) {
+        size_t shared_memory_size = (block_dim.x + 2) * sizeof(float); // BLOCK_SIZE_X + 2
+        for (int row = 0; row < seam_length; row++) {
+            compute_row_cumulative_energy_optimized<<<grid_dim, block_dim, shared_memory_size>>>(
+                device_energy,
+                cumulative_energy,
+                backtrack,
+                search_width,
+                seam_length,
+                row,
+                direction
+            );
+            
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Kernel error at row %d: %s\n", row, cudaGetErrorString(err));
+                exit(1);
+            }
+            
+            cudaDeviceSynchronize();
         }
-        
-        cudaDeviceSynchronize();
+    } else {
+        for (int row = 0; row < seam_length; row++) {
+            compute_row_cumulative_energy<<<grid_dim, block_dim>>>(
+                device_energy,
+                cumulative_energy,
+                backtrack,
+                search_width,
+                seam_length,
+                row,
+                direction
+            );
+            
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Kernel error at row %d: %s\n", row, cudaGetErrorString(err));
+                exit(1);
+            }
+            
+            cudaDeviceSynchronize();
+        }
     }
 
     // Copy results back to host
@@ -203,7 +290,7 @@ int* remove_seam_with_path(Image *img, float *device_energy, int direction) {
 }
 
 // Function to store k seams before insertion
-int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *seam_lengths) {
+int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *seam_lengths, bool optimized) {
     int width = img->width;
     int height = img->height;
     
@@ -240,7 +327,7 @@ int** find_k_seams(Image *img, float *device_energy, int k, int direction, int *
         
         // Find seam
         seam_lengths[i] = direction == 0 ? height : width;
-        seams[i] = remove_seam_with_path(&temp_img, temp_energy, direction);
+        seams[i] = remove_seam_with_path(&temp_img, temp_energy, direction, optimized);
         
         if (!seams[i]) {
             fprintf(stderr, "Failed to find seam %d\n", i);

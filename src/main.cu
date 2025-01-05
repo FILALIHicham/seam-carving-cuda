@@ -8,7 +8,7 @@
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--insert] [--save-seams] [--horizontal] [--target widthxheight]\n", argv[0]);
+        printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--insert] [--save-seams] [--horizontal] [--target widthxheight] [--optimized]\n", argv[0]);
         return 1;
     }
 
@@ -20,6 +20,7 @@ int main(int argc, char *argv[]) {
     int target_width = -1, target_height = -1;
     char *input_image_path = NULL;
     char *output_image_path = NULL;
+    bool optimized = false;
 
     // Flags to check for invalid parameter combinations
     int target_mode = 0;
@@ -49,6 +50,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             target_mode = 1;
+        } else if (strcmp(argv[i], "--optimized") == 0) {
+            optimized = true;
         } else {
             printf("Unknown option: %s\n", argv[i]);
             printf("Usage: %s -i <input_image> -o <output_image> [-n <number_of_seams>] [--insert] [--save-seams] [--horizontal] [--target widthxheight]\n", argv[0]);
@@ -89,7 +92,7 @@ int main(int argc, char *argv[]) {
             printf("Inserting %d vertical seams...\n", width_diff);
             int **seams;
             int *seam_lengths = (int *)malloc(width_diff * sizeof(int));
-            seams = find_k_seams(&img, device_energy, width_diff, 0, seam_lengths);
+            seams = find_k_seams(&img, device_energy, width_diff, 0, seam_lengths, optimized);
 
             for (int i = 0; i < width_diff; i++) {
                 insert_seam(&img, seams[i], 0);
@@ -110,7 +113,7 @@ int main(int argc, char *argv[]) {
             printf("Removing %d vertical seams...\n", -width_diff);
             for (int i = 0; i < -width_diff; i++) {
                 compute_energy(&img, device_energy);  
-                int *seam = remove_seam_with_path(&img, device_energy, 0);
+                int *seam = remove_seam_with_path(&img, device_energy, 0, optimized);
                 printf("Vertical seam %d removed.\n", i + 1);
 
                 if (save_seam_path) {
@@ -131,7 +134,7 @@ int main(int argc, char *argv[]) {
             printf("Inserting %d horizontal seams...\n", height_diff);
             int **seams;
             int *seam_lengths = (int *)malloc(height_diff * sizeof(int));
-            seams = find_k_seams(&img, device_energy, height_diff, 1, seam_lengths);
+            seams = find_k_seams(&img, device_energy, height_diff, 1, seam_lengths, optimized);
 
             for (int i = 0; i < height_diff; i++) {
                 insert_seam(&img, seams[i], 1);
@@ -152,7 +155,7 @@ int main(int argc, char *argv[]) {
             printf("Removing %d horizontal seams...\n", -height_diff);
             for (int i = 0; i < -height_diff; i++) {
                 compute_energy(&img, device_energy);
-                int *seam = remove_seam_with_path(&img, device_energy, 1);
+                int *seam = remove_seam_with_path(&img, device_energy, 1, optimized);
                 printf("Horizontal seam %d removed.\n", i + 1);
 
                 if (save_seam_path) {
@@ -169,7 +172,7 @@ int main(int argc, char *argv[]) {
         printf("Starting seam insertion...\n");
         int **seams;
         int *seam_lengths = (int *)malloc(num_seams * sizeof(int));
-        seams = find_k_seams(&img, device_energy, num_seams, direction, seam_lengths);
+        seams = find_k_seams(&img, device_energy, num_seams, direction, seam_lengths, optimized);
 
         for (int i = 0; i < num_seams; i++) {
             insert_seam(&img, seams[i], direction);
@@ -194,7 +197,7 @@ int main(int argc, char *argv[]) {
             compute_energy(&img, device_energy);
             printf("Energy map computed on GPU for seam %d.\n", i + 1);
 
-            int *seam = remove_seam_with_path(&img, device_energy, direction);
+            int *seam = remove_seam_with_path(&img, device_energy, direction, optimized);
             printf("%s seam %d removed.\n", direction == 0 ? "Vertical" : "Horizontal", i + 1);
 
             // Save seam path if enabled
