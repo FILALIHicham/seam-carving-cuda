@@ -107,7 +107,7 @@ Results will be saved in the `outputs` directory with the following naming conve
 ## Project Structure
 
 ```
-└── FILALIHicham-seam-carving-cuda/
+└── seam-carving-cuda/
     ├── README.md
     ├── LICENSE
     ├── Makefile
